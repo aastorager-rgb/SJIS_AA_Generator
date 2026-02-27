@@ -7,7 +7,7 @@ AA_for_ComfyUI의 간략화/포터블 버전입니다.
 다운로드 방법(.py):
 1. 파이썬 설치
 2. 명령 프롬포트(cmd)에서 pip install PyQt5 opencv-python torch pandas numpy pillow 로 필요한 라이브러리 설치
-3. 생행
+3. 실행
   
 사용법:
 <img width="1920" height="1032" alt="스크린샷 2026-02-28 014553" src="https://github.com/user-attachments/assets/1250daaf-88ea-4702-a942-aaf270f3b1b1" />
