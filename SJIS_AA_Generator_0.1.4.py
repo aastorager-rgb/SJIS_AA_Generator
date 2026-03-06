@@ -24,8 +24,9 @@ EYE_LOW_LEFT = set(list("芍弋爪心父戈弌弍弐式汽辷込乂癶廴匕丈�
 EYE_LOW_RIGHT = set(list("歹万久刋升刈乃汐沙少炒梦斗孑才必瓜欠次亥圦乂ノソルツ八ｧｨｩｫｱｦｳｶｸｹｻｼｽｾﾀﾁﾂﾃﾅﾇﾈﾉﾊﾑﾒﾔﾗﾘﾙﾚﾜﾝァヵ㌧㌢㌃㍗㌣㌻j"))
 EYE_IDIOMS_ALL = EYE_UP_LEFT | EYE_UP_CENTER | EYE_UP_RIGHT | EYE_LOW_LEFT | EYE_LOW_RIGHT
 
-# 사용자 지정 점/특수기호 페널티 리스트
+# 점/특수기호 페널티 리스트 및 수직 앵커
 DOT_PUNCT_CHARS = set(list(".,,，:;¨･・'\"‘’“”；ﾞﾟ．′xｘXＸ_"))
+VERT_CHARS = set(['|', '│', '┃', '!', 'l', 'I', '1', 'ｉ', 'Ｉ', '！', '｜', ':', '⋮'])
 
 def get_char_width(char, font, draw_ctx):
     if hasattr(draw_ctx, 'textlength'): return int(draw_ctx.textlength(char, font=font))
@@ -216,80 +217,162 @@ class SJISPipeline:
 
         return self._char_data_cache, font
 
-    def _get_gap_string(self, width, is_l):
-        if width <= 0: return ""
-        fw_count = int(round(width)) // self._fw_width
-        rem = int(round(width)) % self._fw_width
-        
-        hw_count = 0
-        dot_count = 0
-        
-        if rem >= self._hw_width + self._dot_width:
-            hw_count = 1
-            dot_count = (rem - self._hw_width) // self._dot_width
-        elif rem >= self._hw_width:
-            hw_count = 1
-            dot_count = (rem - self._hw_width) // self._dot_width
-        else:
-            dot_count = rem // self._dot_width
-            
-        res_chars = []
-        if is_l:
-            while fw_count > 0 or hw_count > 0 or dot_count > 0:
-                if fw_count > 0:
-                    res_chars.append('　')
-                    fw_count -= 1
-                if dot_count > 0:
-                    res_chars.append('.')
-                    dot_count -= 1
-                if hw_count > 0:
-                    res_chars.append(' ')
-                    hw_count -= 1
-        else:
-            while dot_count > 0:
-                res_chars.append('.')
-                dot_count -= 1
-            while hw_count > 0:
-                res_chars.append(' ')
-                hw_count -= 1
-            while fw_count > 0:
-                res_chars.append('　')
-                fw_count -= 1
+    def _get_gap_string(self, target_w, is_start, last_char=''):
+        """BFS를 이용해 조건을 만족하면서 오차가 가장 적은(±1px 이내) 공백 조합을 반환합니다."""
+        target_w = round(target_w)
+        if target_w <= 0: return "", 0.0
 
-        res = "".join(res_chars)
-        
-        if is_l and res.startswith(' '):
-            res = '_' + res[1:]
-            
-        return res
+        prefix = ""
+        fw = self._fw_width
+        hw = self._hw_width
+        dt = self._dot_width
 
-    def _solve_stripe_sequential(self, scores, char_data, w, spacing, last_ink_x, is_roi_mask):
-        cur_x = 0.0; line = ""; placements = []; is_l = True
+        # 타겟 길이가 너무 길면 전각 공백으로 먼저 채워 연산 최적화
+        if target_w >= fw * 3:
+            count = int((target_w - fw * 2) // fw)
+            prefix = "　" * count
+            target_w -= count * fw
+            is_start = False
+            last_char = '　'
+
+        # queue: (현재폭, 문자열, 마지막문자, 시작여부, 코스트)
+        queue = [(0, "", last_char, is_start, 0)]
+        visited = {} 
+        best_match = None
+        
+        while queue:
+            cw, s, lc, start_flag, cost = queue.pop(0)
+            
+            diff = abs(target_w - cw)
+            # 오차 허용범위 +-1 이내 도달 시 기록
+            if diff <= 1:
+                if best_match is None or cost < best_match[4]:
+                    best_match = (cw, s, lc, start_flag, cost)
+                elif cost == best_match[4]:
+                    # 비용이 같다면 오차가 적은 것, 그 다음 문자가 적게 쓰인 것 우선
+                    if diff < abs(target_w - best_match[0]):
+                        best_match = (cw, s, lc, start_flag, cost)
+                    elif diff == abs(target_w - best_match[0]) and len(s) < len(best_match[1]):
+                        best_match = (cw, s, lc, start_flag, cost)
+                        
+            if cw > target_w + 1:
+                continue
+                
+            # 1. 전각 공백 (비용: 1)
+            ncost = cost + 1
+            nstate = (cw + fw, '　', False)
+            if visited.get(nstate, float('inf')) > ncost:
+                visited[nstate] = ncost
+                queue.append((cw + fw, s + '　', '　', False, ncost))
+                
+            # 2. 반각 공백 (비용: 2, 조건: 시작불가 & 연속불가)
+            if lc != ' ' and not start_flag:
+                ncost = cost + 2
+                nstate = (cw + hw, ' ', False)
+                if visited.get(nstate, float('inf')) > ncost:
+                    visited[nstate] = ncost
+                    queue.append((cw + hw, s + ' ', ' ', False, ncost))
+
+            # 3. 점 (비용: 5, 연속배치 시 강력 페널티 +20)
+            ncost = cost + 5 + (20 if lc == '.' else 0)
+            nstate = (cw + dt, '.', False)
+            if visited.get(nstate, float('inf')) > ncost:
+                visited[nstate] = ncost
+                queue.append((cw + dt, s + '.', '.', False, ncost))
+
+        if best_match is None:
+            dots = target_w // dt
+            return prefix + "." * dots, len(prefix)*fw + dots*dt
+            
+        best_w, best_s, _, _, _ = best_match
+        final_str = prefix + best_s
+        
+        # 최후의 안전장치: 시작이 반각이면 언더바로 대체
+        if is_start and final_str.startswith(' '):
+            final_str = '_' + final_str[1:]
+            
+        return final_str, (len(prefix) * fw) + best_w
+
+    def _solve_stripe_sequential(self, scores, char_data_list, w, spacing, last_ink_x, is_roi_mask, prev_anchors):
+        cur_x = 0.0
+        line = ""
+        placements = []
+        is_l = True
+        last_char = ''
+        
         while int(round(cur_x)) <= last_ink_x and int(round(cur_x)) < w:
             sx = int(round(cur_x))
+            
             best_idx = np.argmax(scores[sx, :])
-            if scores[sx, best_idx] <= 0.0:
-                gw = min(self._fw_width, w - sx)
-                gs = self._get_gap_string(gw, is_l)
-                if not gs: 
-                    cur_x += max(1.0, float(gw)); continue
-                line += gs
-                for gc in gs:
-                    gcw = self._fw_width if gc == '　' else (self._hw_width if gc in [' ', '_'] else self._dot_width)
-                    ir = np.any(is_roi_mask[int(cur_x):min(w, int(cur_x+gcw))])
-                    placements.append((gc, float(cur_x), gcw, ir))
-                    cur_x += gcw
-                is_l = False; continue
-            char_info = char_data[best_idx]
-            cw = char_info['width']
-            line += char_info['char']
-            ir = np.any(is_roi_mask[sx:min(w, sx+cw)])
-            placements.append((char_info['char'], float(cur_x), cw, ir))
-            cur_x += max(1.0, float(cw) + spacing)
-            is_l = False
+            if scores[sx, best_idx] > 0.0:
+                char_info = char_data_list[best_idx]
+                cw = char_info['width']
+                c = char_info['char']
+                
+                line += c
+                ir = np.any(is_roi_mask[sx:min(w, sx+cw)])
+                placements.append((c, float(cur_x), cw, ir))
+                cur_x += float(cw) + spacing
+                is_l = False
+                last_char = c
+            else:
+                remaining_scores = np.max(scores[sx+1 : w, :], axis=1)
+                valid_indices = np.where(remaining_scores > 0.0)[0]
+                
+                if valid_indices.size > 0:
+                    nx = sx + 1 + valid_indices[0]
+                    best_idx_nx = np.argmax(scores[nx, :])
+                    c_nx = char_data_list[best_idx_nx]['char']
+                    
+                    target_x = float(nx)
+                    if c_nx in VERT_CHARS:
+                        for pa_x in prev_anchors:
+                            if abs(pa_x - target_x) <= 3.0:
+                                target_x = pa_x
+                                break
+                                
+                    gap_req = target_x - cur_x
+                    
+                    if gap_req < self._dot_width * 0.8:
+                        char_info = char_data_list[best_idx_nx]
+                        cw = char_info['width']
+                        line += char_info['char']
+                        ir = np.any(is_roi_mask[int(target_x):min(w, int(target_x+cw))])
+                        placements.append((char_info['char'], float(cur_x), cw, ir))
+                        cur_x += float(cw) + spacing
+                        is_l = False
+                        last_char = char_info['char']
+                    else:
+                        gs, gs_w = self._get_gap_string(gap_req, is_l, last_char)
+                        if gs:
+                            line += gs
+                            cx_temp = cur_x
+                            for gc in gs:
+                                gcw = float(self._fw_width) if gc == '　' else (float(self._hw_width) if gc in [' ', '_'] else float(self._dot_width))
+                                ir = np.any(is_roi_mask[int(cx_temp):min(w, int(cx_temp+gcw))])
+                                placements.append((gc, cx_temp, gcw, ir))
+                                cx_temp += gcw
+                            cur_x += gs_w  # 실제 배치된 정확한 폭만 더하여 오차 누적 방지
+                            is_l = False
+                            last_char = gs[-1]
+                        else:
+                            cur_x += max(1.0, gap_req)
+                else:
+                    gap_req = last_ink_x - sx
+                    if gap_req >= self._dot_width:
+                        gs, gs_w = self._get_gap_string(gap_req, is_l, last_char)
+                        if gs:
+                            line += gs
+                            cx_temp = cur_x
+                            for gc in gs:
+                                gcw = float(self._fw_width) if gc == '　' else (float(self._hw_width) if gc in [' ', '_'] else float(self._dot_width))
+                                ir = np.any(is_roi_mask[int(cx_temp):min(w, int(cx_temp+gcw))])
+                                placements.append((gc, cx_temp, gcw, ir))
+                                cx_temp += gcw
+                    break
         return line, placements
 
-    def _solve_stripe_score_priority(self, score_matrix, char_data_list, w, spacing, last_ink_x, is_roi_mask):
+    def _solve_stripe_score_priority(self, score_matrix, char_data_list, w, spacing, last_ink_x, is_roi_mask, prev_anchors):
         placements = []
         scores = score_matrix.copy()
         if last_ink_x < w: scores[last_ink_x:, :] = -99999.0
@@ -307,7 +390,15 @@ class SJISPipeline:
             char_info = char_data_list[bc]
             cw, c, cf = char_info['width'], char_info['char'], char_info['flags']
             ir = np.any(is_roi_mask[bx:min(w, bx+cw)]) and (cf & 1) > 0
-            placements.append((c, float(bx), cw, ir))
+            
+            target_x = float(bx)
+            if c in VERT_CHARS:
+                for pa_x in prev_anchors:
+                    if abs(pa_x - target_x) <= 3.0:
+                        target_x = pa_x
+                        break
+                        
+            placements.append((c, target_x, cw, ir))
             
             s_margin = 2 if (ir and (cf & 4) > 0) else 0
             eb = min(w, int(bx + cw + spacing + s_margin))
@@ -336,32 +427,43 @@ class SJISPipeline:
                     if r_range.size > 0: scores[eb:be+1, r_i] += bw
 
         placements.sort(key=lambda x: x[1])
-        line = ""; cx = 0.0; isl = True; ap = []
+        line = ""; cx = 0.0; isl = True; ap = []; last_char = ''
         for c, x, cw, ir in placements:
             tx = max(cx, float(x))
             gp = tx - cx
-            if gp >= self._dot_width:
-                gs = self._get_gap_string(gp, isl)
-                line += gs
-                for gc in gs:
-                    gcw = self._fw_width if gc == '　' else (self._hw_width if gc in [' ', '_'] else self._dot_width)
-                    gc_ir = np.any(is_roi_mask[int(cx):min(w, int(cx+gcw))])
-                    ap.append((gc, cx, gcw, gc_ir))
-                    cx += gcw
+            if gp >= self._dot_width * 0.8:
+                gs, gs_w = self._get_gap_string(gp, isl, last_char)
+                if gs:
+                    line += gs
+                    cx_temp = cx
+                    for gc in gs:
+                        gcw = float(self._fw_width) if gc == '　' else (float(self._hw_width) if gc in [' ', '_'] else float(self._dot_width))
+                        gc_ir = np.any(is_roi_mask[int(cx_temp):min(w, int(cx_temp+gcw))])
+                        ap.append((gc, cx_temp, gcw, gc_ir))
+                        cx_temp += gcw
+                    cx += gs_w  # 실제 반환된 폭을 더해 누적 오차 통제
+                    isl = False
+                    last_char = gs[-1]
+            
             ap.append((c, cx, cw, ir))
-            line += c; cx += max(1.0, float(cw) + spacing); isl = False
+            line += c
+            cx += float(cw) + spacing
+            isl = False
+            last_char = c
             
         if cx < w - self._dot_width:
-            gs = self._get_gap_string(w - cx, isl)
-            line += gs
-            for gc in gs:
-                gcw = self._fw_width if gc == '　' else (self._hw_width if gc in [' ', '_'] else self._dot_width)
-                gc_ir = np.any(is_roi_mask[int(cx):min(w, int(cx+gcw))])
-                ap.append((gc, cx, gcw, gc_ir))
-                cx += gcw
+            gs, gs_w = self._get_gap_string(w - cx, isl, last_char)
+            if gs:
+                line += gs
+                cx_temp = cx
+                for gc in gs:
+                    gcw = float(self._fw_width) if gc == '　' else (float(self._hw_width) if gc in [' ', '_'] else float(self._dot_width))
+                    gc_ir = np.any(is_roi_mask[int(cx_temp):min(w, int(cx_temp+gcw))])
+                    ap.append((gc, cx_temp, gcw, gc_ir))
+                    cx_temp += gcw
         return line, ap
 
-    def solve_stripe_hybrid(self, row_img_bin, row_tone, row_cos, row_sin, row_roi, row_roi_weights, char_data_list, spacing, y_t, params):
+    def solve_stripe_hybrid(self, row_img_bin, row_tone, row_cos, row_sin, row_roi, row_roi_weights, char_data_list, spacing, y_t, params, prev_anchors):
         bg_mode = params['bg_mode']
         bg_weight = params['tone_weight']
         
@@ -379,7 +481,7 @@ class SJISPipeline:
         is_roi_mask = (stripe_roi & 1) > 0 
         
         if cv2.countNonZero(row_img_bin) == 0 and not np.any(is_roi_mask) and not force_full_width:
-            return self._solve_stripe_sequential(scores, char_data_list, W, spacing, 0, is_roi_mask)
+            return self._solve_stripe_sequential(scores, char_data_list, W, spacing, 0, is_roi_mask, prev_anchors)
 
         custom_chars = set(list(params.get('custom_chars', '')))
         custom_pen = params.get('custom_penalty', 0.0)
@@ -393,7 +495,7 @@ class SJISPipeline:
             t_wgt = torch.from_numpy(row_roi_weights).unsqueeze(0).unsqueeze(0).to(self._device)
             
             Y_out = H - h + 1
-            if Y_out <= 0: return self._solve_stripe_sequential(scores, char_data_list, W, spacing, 0, is_roi_mask)
+            if Y_out <= 0: return self._solve_stripe_sequential(scores, char_data_list, W, spacing, 0, is_roi_mask, prev_anchors)
             y_pen = (torch.abs(torch.arange(Y_out, device=self._device).view(Y_out, 1) - y_t) * params['y_shift_penalty']).unsqueeze(0)
 
             for cw, g in self._char_groups_cache.items():
@@ -423,7 +525,6 @@ class SJISPipeline:
 
                 calc = ov2 - pha2*cur_w_pha - exc*cur_w_den - mis*cur_w_mis + g['freqs'].view(N,1,1)*cur_w_frq - y_pen
                 
-                # --- Dot & Custom Character Penalty ---
                 is_dot = (g['flags'] & 64) > 0
                 dot_penalty = params.get('dot_penalty', 2.0)
                 calc = torch.where(is_dot.view(N, 1, 1).bool(), calc - dot_penalty, calc)
@@ -467,14 +568,16 @@ class SJISPipeline:
                     if vx.size > 0: scores[vx, idx] = b_np[i][vx]
                     
         if params['p_method'] == "Score-Priority":
-            return self._solve_stripe_score_priority(scores, char_data_list, W, spacing, last_x, is_roi_mask)
-        return self._solve_stripe_sequential(scores, char_data_list, W, spacing, last_x, is_roi_mask)
+            return self._solve_stripe_score_priority(scores, char_data_list, W, spacing, last_x, is_roi_mask, prev_anchors)
+        return self._solve_stripe_sequential(scores, char_data_list, W, spacing, last_x, is_roi_mask, prev_anchors)
 
-    def generate(self, ori_rgb, thinned_bin, mask_bin, params, progress_callback, log_callback):
+    def generate(self, ori_rgb, thinned_bin, mask_bin, params, progress_callback, log_callback, cancel_check=None):
         log_callback("진행 1/5: 리소스 로드 중...")
         res = self.load_resources(params['char_csv'], params['font_path'], params['char_tone'])
         if not res: return None, None, None
         char_data_list, font = res
+        
+        if cancel_check and cancel_check(): return None, None, None
         
         target_h = params['text_lines'] * ROW_HEIGHT
         target_w = int(target_h * (thinned_bin.shape[1] / thinned_bin.shape[0]))
@@ -545,8 +648,21 @@ class SJISPipeline:
         replaced_boxes = [[] for _ in range(len(tasks))]
         
         log_callback(f"진행 2/5: 글자 배치 진행 중... (총 {len(tasks)}줄)")
+        
+        prev_anchors = []
         for idx, t in enumerate(tasks):
-            res_l[idx], all_p[idx] = self.solve_stripe_hybrid(t[0], t[1], t[2], t[3], t[4], t[5], char_data_list, 0.0, m_y, params)
+            if cancel_check and cancel_check():
+                log_callback("❌ 작업이 취소되었습니다.")
+                return None, None, None
+                
+            res_l[idx], all_p[idx] = self.solve_stripe_hybrid(t[0], t[1], t[2], t[3], t[4], t[5], char_data_list, 0.0, m_y, params, prev_anchors)
+            
+            current_anchors = []
+            for (char, x, cw, ir) in all_p[idx]:
+                if char in VERT_CHARS:
+                    current_anchors.append(float(x))
+            prev_anchors = current_anchors
+            
             progress_callback(int((idx / len(tasks)) * 50))
             if idx % 10 == 0: torch.cuda.empty_cache()
 
@@ -578,6 +694,9 @@ class SJISPipeline:
                 return None 
 
             for idx, t in enumerate(tasks):
+                if cancel_check and cancel_check():
+                    return None, None, None
+                    
                 row_tone = t[1][m_y:m_y+ROW_HEIGHT, :]
                 new_line = ""; chunk_chars = ""; chunk_w = 0.0; chunk_start_x = 0.0
                 
@@ -603,6 +722,8 @@ class SJISPipeline:
                 flush_chunk(); res_l[idx] = new_line
                 progress_callback(50 + int((idx / len(tasks)) * 30))
 
+        if cancel_check and cancel_check(): return None, None, None
+
         log_callback("진행 4/5: 좌우 공백 교정 및 그리드 생성 중...")
         for i in range(len(res_l)):
             if res_l[i].startswith(' '):
@@ -625,6 +746,8 @@ class SJISPipeline:
                 thickness = 2 if ir else 1
                 cv2.rectangle(grid_vis, (int(x), int(y)), (int(x+cw), int(y+ROW_HEIGHT)), color, thickness)
 
+        if cancel_check and cancel_check(): return None, None, None
+
         log_callback("진행 5/5: 최종 아스키 이미지 렌더링 중...")
         aa_text = "\n".join(res_l)
         
@@ -644,7 +767,7 @@ class SJISPipeline:
         return aa_text, grid_vis, aa_img_arr
 
 # ==========================================
-# 3. Custom UI Widgets (Slimmer 450px Optimized)
+# 3. Custom UI Widgets 
 # ==========================================
 class SliderSpinBox(QWidget):
     def __init__(self, label, min_val, max_val, step, default_val, is_float=True):
@@ -850,6 +973,13 @@ class WorkerThread(QThread):
         self.img_rgb = img_rgb
         self.mask_bin = mask_bin
         self.params = params
+        self._is_cancelled = False
+        
+    def cancel(self):
+        self._is_cancelled = True
+        
+    def check_cancel(self):
+        return self._is_cancelled
 
     def run(self):
         try:
@@ -857,14 +987,21 @@ class WorkerThread(QThread):
             binary = self.p.extract_lines(self.img_rgb, self.params['text_lines'], self.params['line_method'], self.params['threshold'], self.params['thickness'], self.params['kmeans_k'], True)
             self.sig_line_done.emit(binary)
             
+            if self._is_cancelled: return self.sig_finished.emit("", None, None)
+            
             self.sig_log.emit("▶ [2/3] 세선화 (Thinning) 시작...")
             thinned = self.p.process_thinning(binary, self.params['clean'], self.params['thin_method'])
             self.sig_thinned_done.emit(thinned)
             
-            self.sig_log.emit("▶ [3/3] 아스키 아트 생성 중...")
-            aa_text, grid_vis, aa_img = self.p.generate(self.img_rgb, thinned, self.mask_bin, self.params, self.sig_progress.emit, self.sig_log.emit)
+            if self._is_cancelled: return self.sig_finished.emit("", None, None)
             
-            self.sig_finished.emit(aa_text, grid_vis, aa_img)
+            self.sig_log.emit("▶ [3/3] 아스키 아트 생성 중...")
+            aa_text, grid_vis, aa_img = self.p.generate(self.img_rgb, thinned, self.mask_bin, self.params, self.sig_progress.emit, self.sig_log.emit, self.check_cancel)
+            
+            if self._is_cancelled:
+                self.sig_finished.emit("", None, None)
+            else:
+                self.sig_finished.emit(aa_text, grid_vis, aa_img)
         except Exception as e:
             self.sig_log.emit(f"❌ 오류 발생:\n{str(e)}")
             self.sig_finished.emit("", None, None)
@@ -900,7 +1037,7 @@ class SJISApp(QMainWindow):
             self.log("❌ 에러: 저장할 이미지가 생성되지 않았습니다.")
 
     def initUI(self):
-        self.setWindowTitle("SJIS-Art Generator (Portable V10 - Slim UI)")
+        self.setWindowTitle("SJIS-Art Generator (Portable V11 - Snapping & BFS)")
         self.resize(1600, 1000)
         
         central = QWidget()
@@ -925,7 +1062,7 @@ class SJISApp(QMainWindow):
         ilay.addWidget(self.btn_load)
         
         r1, self.line_font = self.create_load_row("Font:", "Saitamaar.ttf", "Font Files (*.ttf *.otf)")
-        r2, self.line_csv = self.create_load_row("Chars:", "char_list_freq.csv", "CSV Files (*.csv)")
+        r2, self.line_csv = self.create_load_row("Chars:", "char_list_500.csv", "CSV Files (*.csv)")
         r3, self.line_tone = self.create_load_row("Tone:", "char_tone.txt", "Text Files (*.txt)")
         w1=QWidget(); w1.setLayout(r1); ilay.addWidget(w1)
         w2=QWidget(); w2.setLayout(r2); ilay.addWidget(w2)
@@ -935,10 +1072,9 @@ class SJISApp(QMainWindow):
         ilay.addWidget(self.spin_lines)
         left_layout.addWidget(group_input)
 
-        # 2. Parameters Columns (HBox -> Fit in 450px)
+        # 2. Parameters Columns (HBox)
         param_cols = QHBoxLayout()
         
-        # Col 1: Line, Thinning, AA Params
         col1_widget = QWidget()
         col1_lay = QVBoxLayout(col1_widget)
         col1_lay.setContentsMargins(0,0,0,0)
@@ -969,7 +1105,7 @@ class SJISApp(QMainWindow):
         self.combo_place.addItems(["Score-Priority", "Sequential"])
         c2_lay.addWidget(self.combo_place)
         
-        self.spin_pha = SliderSpinBox("Phase W:", 0.0, 10.0, 0.1, 1.5)
+        self.spin_pha = SliderSpinBox("Phase W:", 0.0, 10.0, 0.1, 1.0)
         self.spin_den = SliderSpinBox("Density Pen:", 0.0, 2.0, 0.05, 0.6)
         self.spin_mis = SliderSpinBox("Missing Pen:", 0.0, 2.0, 0.05, 0.3)
         self.spin_frq = SliderSpinBox("Freq Bonus:", 0.0, 20.0, 0.1, 1.0)
@@ -986,7 +1122,6 @@ class SJISApp(QMainWindow):
         col1_lay.addWidget(group_aa)
         col1_lay.addStretch()
 
-        # Col 2: Eye Mask, Tone
         col2_widget = QWidget()
         col2_lay = QVBoxLayout(col2_widget)
         col2_lay.setContentsMargins(0,0,0,0)
@@ -1030,8 +1165,8 @@ class SJISApp(QMainWindow):
         self.combo_bg.currentIndexChanged.connect(self.toggle_tone_params)
         c4_lay.addWidget(self.combo_bg)
         self.spin_tone_w = SliderSpinBox("Tone W:", 0.0, 10.0, 0.1, 1.0)
-        self.spin_contrast = SliderSpinBox("Contrast:", 0.05, 3.0, 0.05, 1.0)
-        self.spin_bright = SliderSpinBox("Brightness:", -1.0, 1.0, 0.05, 0.0)
+        self.spin_contrast = SliderSpinBox("Contrast:", 0.1, 3.0, 0.1, 1.0)
+        self.spin_bright = SliderSpinBox("Brightness:", -1.0, 1.0, 0.1, 0.0)
         
         self.spin_tone_w.setEnabled(False)
         self.spin_contrast.setEnabled(False)
@@ -1058,12 +1193,22 @@ class SJISApp(QMainWindow):
         param_cols.addWidget(col2_widget)
         left_layout.addLayout(param_cols)
 
-        # 3. Generate Button & Progress Bar
+        # 3. Generate & Stop Buttons
+        btn_layout = QHBoxLayout()
         self.btn_gen = QPushButton("Generate ASCII Art")
         self.btn_gen.setMinimumHeight(45)
-        self.btn_gen.setStyleSheet("font-weight: bold; background-color: #4CAF50; color: white; margin-top: 5px;")
+        self.btn_gen.setStyleSheet("font-weight: bold; background-color: #4CAF50; color: white;")
         self.btn_gen.clicked.connect(self.start_generation)
-        left_layout.addWidget(self.btn_gen)
+        
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setMinimumHeight(45)
+        self.btn_stop.setStyleSheet("font-weight: bold; background-color: #F44336; color: white;")
+        self.btn_stop.clicked.connect(self.stop_generation)
+        self.btn_stop.setEnabled(False)
+
+        btn_layout.addWidget(self.btn_gen)
+        btn_layout.addWidget(self.btn_stop)
+        left_layout.addLayout(btn_layout)
         
         self.pbar = QProgressBar()
         left_layout.addWidget(self.pbar)
@@ -1086,7 +1231,6 @@ class SJISApp(QMainWindow):
         self.lbl_img1 = PaintableLabel(); self.lbl_img1.setFrameShape(QFrame.Box)
         w1_lay.addWidget(self.lbl_img1)
         
-        # 2. Line Art (Save 버튼 추가)
         w2_lay = QVBoxLayout()
         w2_header = QHBoxLayout()
         w2_header.addWidget(QLabel("2. Line Art (Extracted & Inverted)"))
@@ -1097,7 +1241,6 @@ class SJISApp(QMainWindow):
         self.lbl_img2 = AspectRatioLabel(); self.lbl_img2.setFrameShape(QFrame.Box)
         w2_lay.addWidget(self.lbl_img2)
 
-        # 3. Thinned (Save 버튼 추가)
         w3_lay = QVBoxLayout()
         w3_header = QHBoxLayout()
         w3_header.addWidget(QLabel("3. Thinned (Skeleton & Inverted)"))
@@ -1108,7 +1251,6 @@ class SJISApp(QMainWindow):
         self.lbl_img3 = AspectRatioLabel(); self.lbl_img3.setFrameShape(QFrame.Box)
         w3_lay.addWidget(self.lbl_img3)
 
-        # 4. Grid Image (Save 버튼 추가)
         w4_lay = QVBoxLayout()
         w4_header = QHBoxLayout()
         w4_header.addWidget(QLabel("4. Grid Image (Visual Analysis)"))
@@ -1119,7 +1261,6 @@ class SJISApp(QMainWindow):
         self.lbl_img4 = AspectRatioLabel(); self.lbl_img4.setFrameShape(QFrame.Box)
         w4_lay.addWidget(self.lbl_img4)
 
-        # 5. Rendered AA Image (Save 버튼 추가)
         w5_lay = QVBoxLayout()
         w5_header = QHBoxLayout()
         w5_header.addWidget(QLabel("5. Rendered AA Image"))
@@ -1151,7 +1292,6 @@ class SJISApp(QMainWindow):
         self.log_box.append(text)
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
 
-    # --- Parameter Toggle Logic ---
     def toggle_line_params(self, index):
         method = self.combo_line.currentText()
         if "K-means" in method:
@@ -1228,6 +1368,12 @@ class SJISApp(QMainWindow):
             self.text_out.clear()
             self.log("▶ 메인 이미지 로드 완료!")
 
+    def stop_generation(self):
+        if hasattr(self, 'thread') and self.thread.isRunning():
+            self.thread.cancel()
+            self.btn_stop.setEnabled(False)
+            self.log("⏸️ 정지 버튼 클릭됨... 작업을 안전하게 종료하는 중입니다.")
+
     def start_generation(self):
         if self.loaded_rgb is None:
             self.log("❌ 에러: 먼저 이미지를 로드하세요.")
@@ -1272,6 +1418,7 @@ class SJISApp(QMainWindow):
         }
         
         self.btn_gen.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.pbar.setValue(0)
         self.text_out.clear()
         
@@ -1300,6 +1447,8 @@ class SJISApp(QMainWindow):
 
     def on_generation_finished(self, text, grid_vis, aa_img_arr):
         self.btn_gen.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        
         if text:
             self.text_out.setPlainText(text)
             
@@ -1313,7 +1462,7 @@ class SJISApp(QMainWindow):
                 qimg_aa = QImage(aa_img_arr.data, w, h, ch * w, QImage.Format_RGB888).copy()
                 self.lbl_img5.setPixmap(QPixmap.fromImage(qimg_aa))
         else:
-            self.log("❌ 작업 실패. 파라미터나 로드된 파일을 다시 확인해주세요.")
+            self.log("❌ 작업 중지 또는 실패.")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
